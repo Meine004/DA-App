@@ -1,0 +1,661 @@
+<meta name='viewport' content='width=device-width, initial-scale=1'/><!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Barber Motorsports Park -- Density Altitude (History + Forecast)</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<style>
+  :root { --bg:#0f1115; --panel:#161a22; --text:#e9edf1; --muted:#9aa3ad; --accent:#5bc0de; --accent2:#71dd8a; }
+  body { margin:0; font-family:system-ui,-apple-system,Segoe UI,Roboto,Inter,Helvetica,Arial,sans-serif; background:var(--bg); color:var(--text); }
+  header { padding:22px 18px; text-align:center; background:linear-gradient(180deg,#141925, #0f1115); border-bottom:1px solid #222a36; }
+  header h1 { margin:0 0 6px; font-size:20px; letter-spacing:.3px; }
+  header p { margin:0; color:var(--muted); font-size:13px; }
+  main { max-width:1100px; margin:18px auto 36px; padding:0 16px; }
+  .card { background:var(--panel); border:1px solid #222a36; border-radius:12px; padding:14px; }
+  #controls { display:grid; grid-template-columns:1fr; gap:12px; }
+  .row { display:flex; flex-wrap:wrap; gap:12px; align-items:flex-end; }
+  label { font-size:12px; color:var(--muted); display:flex; flex-direction:column; gap:6px; }
+  input, select, button { background:#0f131b; color:var(--text); border:1px solid #273142; border-radius:8px; padding:9px 10px; font-size:14px; }
+  button { background:#1c2533; cursor:pointer; transition:.15s border-color,.15s transform; }
+  button:hover { border-color:#3a4a62; transform:translateY(-1px); }
+  .mode { display:flex; gap:10px; align-items:center; }
+  .mode label { flex-direction:row; align-items:center; gap:8px; color:var(--text); font-size:14px; }
+  #summary { display:flex; gap:16px; flex-wrap:wrap; margin-top:10px; color:var(--muted); font-size:13px; }
+  #error { color:#ff6b6b; margin-top:10px; font-size:13px; }
+  canvas { background:#0c1016; border:1px solid #222a36; border-radius:12px; padding:8px; }
+  .hint { color:var(--muted); font-size:12px; margin-top:6px; }
+  .footer { margin-top:10px; color:var(--muted); font-size:12px; text-align:center; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Barber Motorsports Park -- Density Altitude</h1>
+  <p>Historical review + 7–10 day DA forecast (computed from temperature, humidity, and pressure).</p>
+</header>
+
+<main>
+  <div class="card" id="controls">
+    <div class="row">
+      <div class="mode" role="radiogroup" aria-label="Mode">
+        <label><input type="radio" name="mode" value="history" checked> History</label>
+        <label><input type="radio" name="mode" value="forecast"> Forecast</label>
+      </div>
+
+      <div id="historyControls" class="row">
+        <label>Start date
+          <input type="date" id="start">
+        </label>
+        <label>End date
+          <input type="date" id="end">
+        </label>
+        <button id="loadHistory">Load history</button>
+      </div>
+
+      <div id="forecastControls" class="row" style="display:none">
+        <label>Days ahead
+          <select id="forecastDays">
+            <option value="7">7 days</option>
+            <option value="8">8 days</option>
+            <option value="9">9 days</option>
+            <option value="10" selected>10 days</option>
+            <option value="14">14 days</option>
+          </select>
+        </label>
+        <button id="loadForecast">Load forecast</button>
+        <div class="hint">Tip: Forecast uses hourly model data; confidence tapers the farther out you go.</div>
+      </div>
+    </div>
+
+    <div id="summary"></div>
+    <div id="error" role="alert"></div>
+  </div>
+
+  <div style="height:18px"></div>
+
+  <div class="card">
+    <canvas id="chart" height="360"></canvas>
+    <div class="footer">Min/Max band shows daily range from hourly DA. Average line shows the daily mean.</div>
+  </div>
+</main>
+
+<script>
+/** =================== CONFIG =================== **/
+const site = { // Barber Motorsports Park (near Leeds, AL)
+  name: "Barber Motorsports Park",
+  lat: 33.5315,
+  lon: -86.6191,
+  elevationFt: 620, // keep consistent with prior conversation
+  tz: "America/Chicago"
+};
+
+// Chart state
+let daChart;
+
+// Wire up UI
+const $ = sel => document.querySelector(sel);
+const $$ = sel => Array.from(document.querySelectorAll(sel));
+const startEl = $('#start');
+const endEl = $('#end');
+const forecastDaysEl = $('#forecastDays');
+const errorEl = $('#error');
+const summaryEl = $('#summary');
+
+// Initialize defaults (last full month as example)
+(function initDates(){
+  const now = new Date();
+  const year = now.getFullYear();
+  const month = now.getMonth(); // 0-based
+  // default to current month to today's date
+  startEl.value = new Date(year, month, 1).toISOString().slice(0,10);
+  endEl.value   = new Date(year, month+1, 0).toISOString().slice(0,10);
+})();
+
+// Mode toggle
+$$('input[name="mode"]').forEach(r => {
+  r.addEventListener('change', () => {
+    const mode = getMode();
+    $('#historyControls').style.display = mode === 'history' ? '' : 'none';
+    $('#forecastControls').style.display = mode === 'forecast' ? '' : 'none';
+    clearOutputs();
+  });
+});
+
+$('#loadHistory').addEventListener('click', handleHistory);
+$('#loadForecast').addEventListener('click', handleForecast);
+
+// Helpers
+function getMode(){ return $$('input[name="mode"]').find(r=>r.checked).value; }
+function clearOutputs(){ errorEl.textContent=''; summaryEl.textContent=''; }
+
+/** =============== DATA PIPELINE =============== **/
+async function handleHistory(){
+  clearOutputs();
+  const start = startEl.value;
+  const end   = endEl.value;
+  if (!start || !end) { errorEl.textContent = 'Please select start and end dates.'; return; }
+  try {
+    const hourly = await fetchHourlyArchive(site.lat, site.lon, start, end, site.tz);
+    if (!hourly || !hourly.time || hourly.time.length === 0) throw new Error('No hourly data returned.');
+    const daily = reduceHourlyToDailyDA(hourly, site.elevationFt);
+    render(daily, 'History');
+  } catch (e) {
+    errorEl.textContent = `Error: ${e.message || e}`;
+  }
+}
+
+async function handleForecast(){
+  clearOutputs();
+  const days = parseInt(forecastDaysEl.value, 10);
+  try {
+    const hourly = await fetchHourlyForecast(site.lat, site.lon, days, site.tz);
+    if (!hourly || !hourly.time || hourly.time.length === 0) throw new Error('No hourly forecast returned.');
+    const daily = reduceHourlyToDailyDA(hourly, site.elevationFt);
+    render(daily, `Forecast (${days}d)`, true);
+  } catch (e) {
+    errorEl.textContent = `Error: ${e.message || e}`;
+  }
+}
+
+/** -------- Open-Meteo fetchers (keyless, CORS) -------- **/
+async function fetchHourlyArchive(lat, lon, start, end, tz){
+  const url = new URL('https://archive-api.open-meteo.com/v1/archive');
+  url.search = new URLSearchParams({
+    latitude: lat, longitude: lon,
+    start_date: start, end_date: end,
+    timezone: tz,
+    hourly: ['temperature_2m','relative_humidity_2m','surface_pressure'].join(',')
+  });
+  const res = await fetch(url);
+  const json = await res.json();
+  if (!json?.hourly) throw new Error(json?.reason || 'Archive API error');
+  return json.hourly;
+}
+
+async function fetchHourlyForecast(lat, lon, days, tz){
+  // Use standard forecast API; add hourly variables
+  const url = new URL('https://api.open-meteo.com/v1/forecast');
+  url.search = new URLSearchParams({
+    latitude: lat, longitude: lon, timezone: tz,
+    hourly: ['temperature_2m','relative_humidity_2m','surface_pressure'].join(','),
+    forecast_days: String(days)
+  });
+  const res = await fetch(url);
+  const json = await res.json();
+  if (!json?.hourly) throw new Error(json?.reason || 'Forecast API error');
+  return json.hourly;
+}
+
+/** -------- Reduce hourly → daily DA stats -------- **/
+function reduceHourlyToDailyDA(hourly, elevationFt){
+  const { time, temperature_2m: tC, relative_humidity_2m: rh, surface_pressure: p_hPa } = hourly;
+  const days = {};
+  for (let i=0;i<time.length;i++){
+    const day = time[i].split('T')[0];
+    if (!days[day]) days[day] = { da: [] };
+    const da = calcDA_fromHourly(tC[i], rh[i], p_hPa[i], elevationFt);
+    if (isFinite(da)) days[day].da.push(da);
+  }
+  const labels = Object.keys(days).sort();
+  const avg = [], dmin = [], dmax = [];
+  labels.forEach(d => {
+    const arr = days[d].da;
+    const a = arr.reduce((s,v)=>s+v,0)/arr.length;
+    const mn = Math.min(...arr);
+    const mx = Math.max(...arr);
+    avg.push(a);
+    dmin.push(mn);
+    dmax.push(mx);
+  });
+  return { labels, avg, min: dmin, max: dmax };
+}
+
+/** -------- Density Altitude (from hourly T/RH/P) --------
+ * Inputs:
+ *  tempC -- °C
+ *  rh    -- % (0–100)
+ *  p_hPa -- hPa (station pressure)
+ *  elevationFt -- feet (site elevation)
+ * Method:
+ *  - compute virtual temperature from T/RH/Pressure
+ *  - compute pressure altitude from station pressure
+ *  - adjust using ISA lapse approximation to yield DA
+ */
+function calcDA_fromHourly(tempC, rh, p_hPa, elevationFt){
+  if (!isFinite(tempC) || !isFinite(rh) || !isFinite(p_hPa)) return NaN;
+
+  // Saturation vapor pressure (Magnus, hPa)
+  const es = 6.112 * Math.exp((17.67 * tempC) / (tempC + 243.5));
+  const e  = es * (Math.max(0, Math.min(100, rh)) / 100); // actual vapor pressure (hPa)
+
+  // Virtual temperature (K)
+  const tempK = tempC + 273.15;
+  const Tv = tempK / (1 - (e / p_hPa) * (1 - 0.622)); // virtual temp accounts for humidity
+
+  // Pressure altitude (ft) from station pressure (inHg)
+  const pinHg = p_hPa * 0.02953;
+  const pressureAltFt = (1 - Math.pow(pinHg / 29.921, 0.190284)) * 145366.45;
+
+  // Convert virtual temp (K) to "excess over ISA at sea level" and scale (FAA approx)
+  // 288.15 K is ISA at sea level. 1 K ≈ 118.8 ft (approx density altitude scaling).
+  const daAdjFromTemp = 118.8 * (Tv - 288.15);
+
+  // Combine and nudge to station elevation (keeps DA sensible near field elevation)
+  const densityAltFt = pressureAltFt + daAdjFromTemp + (elevationFt - pressureAltFt);
+  return densityAltFt;
+}
+
+/** =================== CHART =================== **/
+function render(daily, labelSuffix, isForecast=false){
+  const { labels, avg, min, max } = daily;
+
+  // Summary
+  const all = [...min, ...max];
+  const minAll = Math.round(Math.min(...all));
+  const maxAll = Math.round(Math.max(...all));
+  const avgAll = Math.round(avg.reduce((s,v)=>s+v,0)/avg.length);
+  summaryEl.textContent = `Range: ${minAll.toLocaleString()} – ${maxAll.toLocaleString()} ft  ·  Average: ${avgAll.toLocaleString()} ft  ·  ${site.name}`;
+
+  // Build datasets: min/max filled band + average line
+  const minDs = {
+    label: 'Daily Min DA',
+    data: min,
+    borderColor: 'rgba(0,0,0,0)',
+    backgroundColor: 'rgba(88, 160, 255, 0.08)',
+    pointRadius: 0,
+    tension: 0.25,
+    fill: '+1', // fill to the next dataset (max)
+    order: 1
+  };
+  const maxDs = {
+    label: 'Daily Max DA',
+    data: max,
+    borderColor: 'rgba(0,0,0,0)',
+    backgroundColor: 'rgba(88, 160, 255, 0.08)',
+    pointRadius: 0,
+    tension: 0.25,
+    fill: false,
+    order: 1
+  };
+  const avgDs = {
+    label: `Daily Avg DA ${labelSuffix ? '-- '+labelSuffix : ''}`,
+    data: avg,
+    borderColor: isForecast ? '#71dd8a' : '#5bc0de',
+    backgroundColor: 'transparent',
+    pointRadius: 2,
+    pointHoverRadius: 4,
+    borderWidth: 2,
+    tension: 0.25,
+    order: 0
+  };
+
+  const ctx = document.getElementById('chart').getContext('2d');
+  if (daChart) daChart.destroy();
+  daChart = new Chart(ctx, {
+    type: 'line',
+    data: { labels, datasets: [minDs, maxDs, avgDs] },
+    options: {
+      responsive: true,
+      interaction: { mode: 'index', intersect: false },
+      plugins: {
+        legend: { labels: { color: '#e9edf1' } },
+        tooltip: {
+          callbacks: {
+            label: (ctx) => {
+              const v = ctx.parsed.y;
+              return `${ctx.dataset.label}: ${Math.round(v).toLocaleString()} ft`;
+            }
+          }
+        }
+      },
+      scales: {
+        x: {
+          ticks: { color: '#c7ced6' },
+          grid: { color: '#1f2532' },
+          title: { display: true, text: 'Date', color: '#9aa3ad' }
+        },
+        y: {
+          ticks: { color: '#c7ced6' },
+          grid: { color: '#1f2532' },
+          title: { display: true, text: 'Density Altitude (ft)', color: '#9aa3ad' }
+        }
+      }
+    }
+  });
+}
+
+// Optional: load a quick default (this month history) so the page isn't empty
+handleHistory().catch(()=>{ /* ignore on first load */ });
+</script>
+</body>
+<<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Barber Motorsports Park — Density Altitude (History + Forecast)</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<style>
+  :root { --bg:#0f1115; --panel:#161a22; --text:#e9edf1; --muted:#9aa3ad; --accent:#5bc0de; --accent2:#71dd8a; }
+  body { margin:0; font-family:system-ui,-apple-system,Segoe UI,Roboto,Inter,Helvetica,Arial,sans-serif; background:var(--bg); color:var(--text); }
+  header { padding:22px 18px; text-align:center; background:linear-gradient(180deg,#141925, #0f1115); border-bottom:1px solid #222a36; }
+  header h1 { margin:0 0 6px; font-size:20px; letter-spacing:.3px; }
+  header p { margin:0; color:var(--muted); font-size:13px; }
+  main { max-width:1100px; margin:18px auto 36px; padding:0 16px; }
+  .card { background:var(--panel); border:1px solid #222a36; border-radius:12px; padding:14px; }
+  #controls { display:grid; grid-template-columns:1fr; gap:12px; }
+  .row { display:flex; flex-wrap:wrap; gap:12px; align-items:flex-end; }
+  label { font-size:12px; color:var(--muted); display:flex; flex-direction:column; gap:6px; }
+  input, select, button { background:#0f131b; color:var(--text); border:1px solid #273142; border-radius:8px; padding:9px 10px; font-size:14px; }
+  button { background:#1c2533; cursor:pointer; transition:.15s border-color,.15s transform; }
+  button:hover { border-color:#3a4a62; transform:translateY(-1px); }
+  .mode { display:flex; gap:10px; align-items:center; }
+  .mode label { flex-direction:row; align-items:center; gap:8px; color:var(--text); font-size:14px; }
+  #summary { display:flex; gap:16px; flex-wrap:wrap; margin-top:10px; color:var(--muted); font-size:13px; }
+  #error { color:#ff6b6b; margin-top:10px; font-size:13px; }
+  canvas { background:#0c1016; border:1px solid #222a36; border-radius:12px; padding:8px; }
+  .hint { color:var(--muted); font-size:12px; margin-top:6px; }
+  .footer { margin-top:10px; color:var(--muted); font-size:12px; text-align:center; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Barber Motorsports Park — Density Altitude</h1>
+  <p>Historical review + 7–10 day DA forecast (computed from temperature, humidity, and pressure).</p>
+</header>
+
+<main>
+  <div class="card" id="controls">
+    <div class="row">
+      <div class="mode" role="radiogroup" aria-label="Mode">
+        <label><input type="radio" name="mode" value="history" checked> History</label>
+        <label><input type="radio" name="mode" value="forecast"> Forecast</label>
+      </div>
+
+      <div id="historyControls" class="row">
+        <label>Start date
+          <input type="date" id="start">
+        </label>
+        <label>End date
+          <input type="date" id="end">
+        </label>
+        <button id="loadHistory">Load history</button>
+      </div>
+
+      <div id="forecastControls" class="row" style="display:none">
+        <label>Days ahead
+          <select id="forecastDays">
+            <option value="7">7 days</option>
+            <option value="8">8 days</option>
+            <option value="9">9 days</option>
+            <option value="10" selected>10 days</option>
+            <option value="14">14 days</option>
+          </select>
+        </label>
+        <button id="loadForecast">Load forecast</button>
+        <div class="hint">Tip: Forecast uses hourly model data; confidence tapers the farther out you go.</div>
+      </div>
+    </div>
+
+    <div id="summary"></div>
+    <div id="error" role="alert"></div>
+  </div>
+
+  <div style="height:18px"></div>
+
+  <div class="card">
+    <canvas id="chart" height="360"></canvas>
+    <div class="footer">Min/Max band shows daily range from hourly DA. Average line shows the daily mean.</div>
+  </div>
+</main>
+
+<script>
+/** =================== CONFIG =================== **/
+const site = { // Barber Motorsports Park (near Leeds, AL)
+  name: "Barber Motorsports Park",
+  lat: 33.5315,
+  lon: -86.6191,
+  elevationFt: 620, // keep consistent with prior conversation
+  tz: "America/Chicago"
+};
+
+// Chart state
+let daChart;
+
+// Wire up UI
+const $ = sel => document.querySelector(sel);
+const $$ = sel => Array.from(document.querySelectorAll(sel));
+const startEl = $('#start');
+const endEl = $('#end');
+const forecastDaysEl = $('#forecastDays');
+const errorEl = $('#error');
+const summaryEl = $('#summary');
+
+// Initialize defaults (last full month as example)
+(function initDates(){
+  const now = new Date();
+  const year = now.getFullYear();
+  const month = now.getMonth(); // 0-based
+  // default to current month to today's date
+  startEl.value = new Date(year, month, 1).toISOString().slice(0,10);
+  endEl.value   = new Date(year, month+1, 0).toISOString().slice(0,10);
+})();
+
+// Mode toggle
+$$('input[name="mode"]').forEach(r => {
+  r.addEventListener('change', () => {
+    const mode = getMode();
+    $('#historyControls').style.display = mode === 'history' ? '' : 'none';
+    $('#forecastControls').style.display = mode === 'forecast' ? '' : 'none';
+    clearOutputs();
+  });
+});
+
+$('#loadHistory').addEventListener('click', handleHistory);
+$('#loadForecast').addEventListener('click', handleForecast);
+
+// Helpers
+function getMode(){ return $$('input[name="mode"]').find(r=>r.checked).value; }
+function clearOutputs(){ errorEl.textContent=''; summaryEl.textContent=''; }
+
+/** =============== DATA PIPELINE =============== **/
+async function handleHistory(){
+  clearOutputs();
+  const start = startEl.value;
+  const end   = endEl.value;
+  if (!start || !end) { errorEl.textContent = 'Please select start and end dates.'; return; }
+  try {
+    const hourly = await fetchHourlyArchive(site.lat, site.lon, start, end, site.tz);
+    if (!hourly || !hourly.time || hourly.time.length === 0) throw new Error('No hourly data returned.');
+    const daily = reduceHourlyToDailyDA(hourly, site.elevationFt);
+    render(daily, 'History');
+  } catch (e) {
+    errorEl.textContent = `Error: ${e.message || e}`;
+  }
+}
+
+async function handleForecast(){
+  clearOutputs();
+  const days = parseInt(forecastDaysEl.value, 10);
+  try {
+    const hourly = await fetchHourlyForecast(site.lat, site.lon, days, site.tz);
+    if (!hourly || !hourly.time || hourly.time.length === 0) throw new Error('No hourly forecast returned.');
+    const daily = reduceHourlyToDailyDA(hourly, site.elevationFt);
+    render(daily, `Forecast (${days}d)`, true);
+  } catch (e) {
+    errorEl.textContent = `Error: ${e.message || e}`;
+  }
+}
+
+/** -------- Open-Meteo fetchers (keyless, CORS) -------- **/
+async function fetchHourlyArchive(lat, lon, start, end, tz){
+  const url = new URL('https://archive-api.open-meteo.com/v1/archive');
+  url.search = new URLSearchParams({
+    latitude: lat, longitude: lon,
+    start_date: start, end_date: end,
+    timezone: tz,
+    hourly: ['temperature_2m','relative_humidity_2m','surface_pressure'].join(',')
+  });
+  const res = await fetch(url);
+  const json = await res.json();
+  if (!json?.hourly) throw new Error(json?.reason || 'Archive API error');
+  return json.hourly;
+}
+
+async function fetchHourlyForecast(lat, lon, days, tz){
+  // Use standard forecast API; add hourly variables
+  const url = new URL('https://api.open-meteo.com/v1/forecast');
+  url.search = new URLSearchParams({
+    latitude: lat, longitude: lon, timezone: tz,
+    hourly: ['temperature_2m','relative_humidity_2m','surface_pressure'].join(','),
+    forecast_days: String(days)
+  });
+  const res = await fetch(url);
+  const json = await res.json();
+  if (!json?.hourly) throw new Error(json?.reason || 'Forecast API error');
+  return json.hourly;
+}
+
+/** -------- Reduce hourly → daily DA stats -------- **/
+function reduceHourlyToDailyDA(hourly, elevationFt){
+  const { time, temperature_2m: tC, relative_humidity_2m: rh, surface_pressure: p_hPa } = hourly;
+  const days = {};
+  for (let i=0;i<time.length;i++){
+    const day = time[i].split('T')[0];
+    if (!days[day]) days[day] = { da: [] };
+    const da = calcDA_fromHourly(tC[i], rh[i], p_hPa[i], elevationFt);
+    if (isFinite(da)) days[day].da.push(da);
+  }
+  const labels = Object.keys(days).sort();
+  const avg = [], dmin = [], dmax = [];
+  labels.forEach(d => {
+    const arr = days[d].da;
+    const a = arr.reduce((s,v)=>s+v,0)/arr.length;
+    const mn = Math.min(...arr);
+    const mx = Math.max(...arr);
+    avg.push(a);
+    dmin.push(mn);
+    dmax.push(mx);
+  });
+  return { labels, avg, min: dmin, max: dmax };
+}
+
+/** -------- Density Altitude (from hourly T/RH/P) --------
+ * Inputs:
+ *  tempC — °C
+ *  rh    — % (0–100)
+ *  p_hPa — hPa (station pressure)
+ *  elevationFt — feet (site elevation)
+ * Method:
+ *  - compute virtual temperature from T/RH/Pressure
+ *  - compute pressure altitude from station pressure
+ *  - adjust using ISA lapse approximation to yield DA
+ */
+function calcDA_fromHourly(tempC, rh, p_hPa, elevationFt){
+  if (!isFinite(tempC) || !isFinite(rh) || !isFinite(p_hPa)) return NaN;
+
+  // Saturation vapor pressure (Magnus, hPa)
+  const es = 6.112 * Math.exp((17.67 * tempC) / (tempC + 243.5));
+  const e  = es * (Math.max(0, Math.min(100, rh)) / 100); // actual vapor pressure (hPa)
+
+  // Virtual temperature (K)
+  const tempK = tempC + 273.15;
+  const Tv = tempK / (1 - (e / p_hPa) * (1 - 0.622)); // virtual temp accounts for humidity
+
+  // Pressure altitude (ft) from station pressure (inHg)
+  const pinHg = p_hPa * 0.02953;
+  const pressureAltFt = (1 - Math.pow(pinHg / 29.921, 0.190284)) * 145366.45;
+
+  // Convert virtual temp (K) to “excess over ISA at sea level” and scale (FAA approx)
+  // 288.15 K is ISA at sea level. 1 K ≈ 118.8 ft (approx density altitude scaling).
+  const daAdjFromTemp = 118.8 * (Tv - 288.15);
+
+  // Combine and nudge to station elevation (keeps DA sensible near field elevation)
+  const densityAltFt = pressureAltFt + daAdjFromTemp + (elevationFt - pressureAltFt);
+  return densityAltFt;
+}
+
+/** =================== CHART =================== **/
+function render(daily, labelSuffix, isForecast=false){
+  const { labels, avg, min, max } = daily;
+
+  // Summary
+  const all = [...min, ...max];
+  const minAll = Math.round(Math.min(...all));
+  const maxAll = Math.round(Math.max(...all));
+  const avgAll = Math.round(avg.reduce((s,v)=>s+v,0)/avg.length);
+  summaryEl.textContent = `Range: ${minAll.toLocaleString()} – ${maxAll.toLocaleString()} ft  ·  Average: ${avgAll.toLocaleString()} ft  ·  ${site.name}`;
+
+  // Build datasets: min/max filled band + average line
+  const minDs = {
+    label: 'Daily Min DA',
+    data: min,
+    borderColor: 'rgba(0,0,0,0)',
+    backgroundColor: 'rgba(88, 160, 255, 0.08)',
+    pointRadius: 0,
+    tension: 0.25,
+    fill: '+1', // fill to the next dataset (max)
+    order: 1
+  };
+  const maxDs = {
+    label: 'Daily Max DA',
+    data: max,
+    borderColor: 'rgba(0,0,0,0)',
+    backgroundColor: 'rgba(88, 160, 255, 0.08)',
+    pointRadius: 0,
+    tension: 0.25,
+    fill: false,
+    order: 1
+  };
+  const avgDs = {
+    label: `Daily Avg DA ${labelSuffix ? '— '+labelSuffix : ''}`,
+    data: avg,
+    borderColor: isForecast ? '#71dd8a' : '#5bc0de',
+    backgroundColor: 'transparent',
+    pointRadius: 2,
+    pointHoverRadius: 4,
+    borderWidth: 2,
+    tension: 0.25,
+    order: 0
+  };
+
+  const ctx = document.getElementById('chart').getContext('2d');
+  if (daChart) daChart.destroy();
+  daChart = new Chart(ctx, {
+    type: 'line',
+    data: { labels, datasets: [minDs, maxDs, avgDs] },
+    options: {
+      responsive: true,
+      interaction: { mode: 'index', intersect: false },
+      plugins: {
+        legend: { labels: { color: '#e9edf1' } },
+        tooltip: {
+          callbacks: {
+            label: (ctx) => {
+              const v = ctx.parsed.y;
+              return `${ctx.dataset.label}: ${Math.round(v).toLocaleString()} ft`;
+            }
+          }
+        }
+      },
+      scales: {
+        x: {
+          ticks: { color: '#c7ced6' },
+          grid: { color: '#1f2532' },
+          title: { display: true, text: 'Date', color: '#9aa3ad' }
+        },
+        y: {
+          ticks: { color: '#c7ced6' },
+          grid: { color: '#1f2532' },
+          title: { display: true, text: 'Density Altitude (ft)', color: '#9aa3ad' }
+        }
+      }
+    }
+  });
+}
+
+// Optional: load a quick default (this month history) so the page isn’t empty
+handleHistory().catch(()=>{ /* ignore on first load */ });
+</script>
+</body>
+</html>/html>
