@@ -67,6 +67,12 @@
       </div>
     </div>
 
+    <!-- ZIP code input -->
+    <label>ZIP Code
+      <input type="text" id="zipCode" placeholder="Enter ZIP">
+      <button id="setZip">Set Location</button>
+    </label>
+
     <div id="summary"></div>
     <div id="error" role="alert"></div>
   </div>
@@ -85,7 +91,7 @@ const site = { // Barber Motorsports Park (near Leeds, AL)
   name: "Barber Motorsports Park",
   lat: 33.5315,
   lon: -86.6191,
-  elevationFt: 620, // keep consistent with prior conversation
+  elevationFt: 620,
   tz: "America/Chicago"
 };
 
@@ -100,13 +106,14 @@ const endEl = $('#end');
 const forecastDaysEl = $('#forecastDays');
 const errorEl = $('#error');
 const summaryEl = $('#summary');
+const zipEl = $('#zipCode');
+const setZipBtn = $('#setZip');
 
 // Initialize defaults (last full month as example)
 (function initDates(){
   const now = new Date();
   const year = now.getFullYear();
-  const month = now.getMonth(); // 0-based
-  // default to current month to today's date
+  const month = now.getMonth();
   startEl.value = new Date(year, month, 1).toISOString().slice(0,10);
   endEl.value   = new Date(year, month+1, 0).toISOString().slice(0,10);
 })();
@@ -123,6 +130,24 @@ $$('input[name="mode"]').forEach(r => {
 
 $('#loadHistory').addEventListener('click', handleHistory);
 $('#loadForecast').addEventListener('click', handleForecast);
+
+// ZIP code button
+setZipBtn.addEventListener('click', async () => {
+  const zip = zipEl.value.trim();
+  if (!zip) { errorEl.textContent = 'Please enter a ZIP code.'; return; }
+  clearOutputs();
+  try {
+    const res = await fetch(`https://nominatim.openstreetmap.org/search?format=json&postalcode=${zip}&country=US`);
+    const data = await res.json();
+    if (!data || data.length === 0) throw new Error('ZIP code not found.');
+    const loc = data[0];
+    site.lat = parseFloat(loc.lat);
+    site.lon = parseFloat(loc.lon);
+    summaryEl.textContent = `Location set to ZIP ${zip} (Lat: ${site.lat.toFixed(4)}, Lon: ${site.lon.toFixed(4)})`;
+  } catch (e) {
+    errorEl.textContent = `Error setting ZIP: ${e.message || e}`;
+  }
+});
 
 // Helpers
 function getMode(){ return $$('input[name="mode"]').find(r=>r.checked).value; }
@@ -172,160 +197,4 @@ async function fetchHourlyArchive(lat, lon, start, end, tz){
   return json.hourly;
 }
 
-async function fetchHourlyForecast(lat, lon, days, tz){
-  // Use standard forecast API; add hourly variables
-  const url = new URL('https://api.open-meteo.com/v1/forecast');
-  url.search = new URLSearchParams({
-    latitude: lat, longitude: lon, timezone: tz,
-    hourly: ['temperature_2m','relative_humidity_2m','surface_pressure'].join(','),
-    forecast_days: String(days)
-  });
-  const res = await fetch(url);
-  const json = await res.json();
-  if (!json?.hourly) throw new Error(json?.reason || 'Forecast API error');
-  return json.hourly;
-}
-
-/** -------- Reduce hourly → daily DA stats -------- **/
-function reduceHourlyToDailyDA(hourly, elevationFt){
-  const { time, temperature_2m: tC, relative_humidity_2m: rh, surface_pressure: p_hPa } = hourly;
-  const days = {};
-  for (let i=0;i<time.length;i++){
-    const day = time[i].split('T')[0];
-    if (!days[day]) days[day] = { da: [] };
-    const da = calcDA_fromHourly(tC[i], rh[i], p_hPa[i], elevationFt);
-    if (isFinite(da)) days[day].da.push(da);
-  }
-  const labels = Object.keys(days).sort();
-  const avg = [], dmin = [], dmax = [];
-  labels.forEach(d => {
-    const arr = days[d].da;
-    const a = arr.reduce((s,v)=>s+v,0)/arr.length;
-    const mn = Math.min(...arr);
-    const mx = Math.max(...arr);
-    avg.push(a);
-    dmin.push(mn);
-    dmax.push(mx);
-  });
-  return { labels, avg, min: dmin, max: dmax };
-}
-
-/** -------- Density Altitude (from hourly T/RH/P) --------
- * Inputs:
- *  tempC — °C
- *  rh    — % (0–100)
- *  p_hPa — hPa (station pressure)
- *  elevationFt — feet (site elevation)
- * Method:
- *  - compute virtual temperature from T/RH/Pressure
- *  - compute pressure altitude from station pressure
- *  - adjust using ISA lapse approximation to yield DA
- */
-function calcDA_fromHourly(tempC, rh, p_hPa, elevationFt){
-  if (!isFinite(tempC) || !isFinite(rh) || !isFinite(p_hPa)) return NaN;
-
-  // Saturation vapor pressure (Magnus, hPa)
-  const es = 6.112 * Math.exp((17.67 * tempC) / (tempC + 243.5));
-  const e  = es * (Math.max(0, Math.min(100, rh)) / 100); // actual vapor pressure (hPa)
-
-  // Virtual temperature (K)
-  const tempK = tempC + 273.15;
-  const Tv = tempK / (1 - (e / p_hPa) * (1 - 0.622)); // virtual temp accounts for humidity
-
-  // Pressure altitude (ft) from station pressure (inHg)
-  const pinHg = p_hPa * 0.02953;
-  const pressureAltFt = (1 - Math.pow(pinHg / 29.921, 0.190284)) * 145366.45;
-
-  // Convert virtual temp (K) to “excess over ISA at sea level” and scale (FAA approx)
-  // 288.15 K is ISA at sea level. 1 K ≈ 118.8 ft (approx density altitude scaling).
-  const daAdjFromTemp = 118.8 * (Tv - 288.15);
-
-  // Combine and nudge to station elevation (keeps DA sensible near field elevation)
-  const densityAltFt = pressureAltFt + daAdjFromTemp + (elevationFt - pressureAltFt);
-  return densityAltFt;
-}
-
-/** =================== CHART =================== **/
-function render(daily, labelSuffix, isForecast=false){
-  const { labels, avg, min, max } = daily;
-
-  // Summary
-  const all = [...min, ...max];
-  const minAll = Math.round(Math.min(...all));
-  const maxAll = Math.round(Math.max(...all));
-  const avgAll = Math.round(avg.reduce((s,v)=>s+v,0)/avg.length);
-  summaryEl.textContent = `Range: ${minAll.toLocaleString()} – ${maxAll.toLocaleString()} ft  ·  Average: ${avgAll.toLocaleString()} ft  ·  ${site.name}`;
-
-  // Build datasets: min/max filled band + average line
-  const minDs = {
-    label: 'Daily Min DA',
-    data: min,
-    borderColor: 'rgba(0,0,0,0)',
-    backgroundColor: 'rgba(88, 160, 255, 0.08)',
-    pointRadius: 0,
-    tension: 0.25,
-    fill: '+1', // fill to the next dataset (max)
-    order: 1
-  };
-  const maxDs = {
-    label: 'Daily Max DA',
-    data: max,
-    borderColor: 'rgba(0,0,0,0)',
-    backgroundColor: 'rgba(88, 160, 255, 0.08)',
-    pointRadius: 0,
-    tension: 0.25,
-    fill: false,
-    order: 1
-  };
-  const avgDs = {
-    label: `Daily Avg DA ${labelSuffix ? '— '+labelSuffix : ''}`,
-    data: avg,
-    borderColor: isForecast ? '#71dd8a' : '#5bc0de',
-    backgroundColor: 'transparent',
-    pointRadius: 2,
-    pointHoverRadius: 4,
-    borderWidth: 2,
-    tension: 0.25,
-    order: 0
-  };
-
-  const ctx = document.getElementById('chart').getContext('2d');
-  if (daChart) daChart.destroy();
-  daChart = new Chart(ctx, {
-    type: 'line',
-    data: { labels, datasets: [minDs, maxDs, avgDs] },
-    options: {
-      responsive: true,
-      interaction: { mode: 'index', intersect: false },
-      plugins: {
-        legend: { labels: { color: '#e9edf1' } },
-        tooltip: {
-          callbacks: {
-            label: (ctx) => {
-              const v = ctx.parsed.y;
-              return `${ctx.dataset.label}: ${Math.round(v).toLocaleString()} ft`;
-            }
-          }
-        }
-      },
-      scales: {
-        x: {
-          ticks: { color: '#c7ced6' },
-          grid: { color: '#1f2532' },
-          title: { display: true, text: 'Date', color: '#9aa3ad' }
-        },
-        y: {
-          ticks: { color: '#c7ced6' },
-          grid: { color: '#1f2532' },
-          title: { display: true, text: 'Density Altitude (ft)', color: '#9aa3ad' }
-        }
-      }
-    }
-  });
-}
-
-// Optional: load a quick default (this month history) so the page isn’t empty
-handleHistory().catch(()=>{ /* ignore on first load */ });
-</script>
-</body>
-</html>
+async function fetchHourly
